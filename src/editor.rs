@@ -318,7 +318,15 @@ pub fn read_line(
     loop {
         let item = src.next_item();
         if matches!(item, InputItem::WouldBlock) {
-            // 无键可读时让出 CPU（避免空转）。
+            // 队列空：**请输入源自己去补**（它才知道背后是键盘还是事件总线）。
+            // 补到东西就立刻重试；补不到才让出 CPU，避免空转烧满。
+            //
+            // **此处曾是真实缺陷**：初版无条件 yield 后 continue，而调用方
+            // 只在进本函数前泵过一次输入，于是后续按键永远进不来——
+            // 用户看到的是「登录后 shell 死了」。见 L-2 验收记录。
+            if src.refill() {
+                continue;
+            }
             let _ = libsys::yield_now();
             continue;
         }
@@ -681,6 +689,74 @@ mod tests {
         assert_eq!(longest_common_prefix(&[b"abc".to_vec(), b"abd".to_vec()]), 2);
         assert_eq!(longest_common_prefix(&[b"ab".to_vec(), b"abc".to_vec()]), 2);
         assert_eq!(longest_common_prefix(&[b"a".to_vec(), b"b".to_vec()]), 0);
+    }
+
+    // ---------------- 输入源的「补货」契约（L-2 真实缺陷回归） ----------------
+
+    /// 一个**初始为空、只能靠 refill 供货**的输入源。
+    ///
+    /// 现实中 HID 键盘就是这样：`read_line` 进入时队列是空的，字符随按键
+    /// 陆续到达。初版 `read_line` 在 `WouldBlock` 时只 yield 不调 refill，
+    /// 于是这类源永远读不到东西——**这正是 L-2 首轮把 shell 弄死的缺陷**。
+    struct DripSource {
+        chunks: Vec<Vec<u8>>,
+        buf: ByteSource,
+        refills: usize,
+    }
+
+    impl InputSource for DripSource {
+        fn next_item(&mut self) -> InputItem {
+            self.buf.next_item()
+        }
+        fn refill(&mut self) -> bool {
+            self.refills += 1;
+            if self.chunks.is_empty() {
+                return false;
+            }
+            let c = self.chunks.remove(0);
+            self.buf.push_bytes(&c);
+            true
+        }
+    }
+
+    /// **回归**：输入不是一开始就齐的，而是逐次 refill 才到齐；
+    /// `read_line` 必须在空队列时主动 refill，否则永远拿不到这一行。
+    #[test]
+    fn read_line_refills_empty_source_until_line_arrives() {
+        let mut e = Editor::new();
+        let mut h = FakeHost::default();
+        let mut src = DripSource {
+            chunks: vec![b"o".to_vec(), b"k".to_vec(), b"\r".to_vec(), vec![0x04]],
+            buf: ByteSource::new(),
+            refills: 0,
+        };
+        let act = read_line(&mut e, &mut src, &mut h, |_| {});
+        assert_eq!(act, EditAction::Submitted(b"ok".to_vec()));
+        assert!(src.refills >= 3, "must have refilled for each chunk");
+    }
+
+    /// `ByteSource::refill` 如实报「无新增」，不伪造数据。
+    #[test]
+    fn byte_source_refill_reports_no_new_bytes() {
+        let mut s = ByteSource::new();
+        assert!(!s.refill());
+        s.push_bytes(b"x");
+        assert!(!s.refill(), "push_bytes is the caller's job, not refill's");
+    }
+
+    /// 输入源**彻底枯竭**时，`read_line` 必须诚实返回（不得死循环）。
+    /// 用 Eof 终结，证明循环有出口。
+    #[test]
+    fn read_line_terminates_on_eof_from_empty_source() {
+        let mut e = Editor::new();
+        let mut h = FakeHost::default();
+        let mut src = DripSource {
+            chunks: vec![b"a".to_vec(), vec![0x04]], // 'a' then ^D
+            buf: ByteSource::new(),
+            refills: 0,
+        };
+        let act = read_line(&mut e, &mut src, &mut h, |_| {});
+        assert_eq!(act, EditAction::Eof(b"a".to_vec()));
     }
 
     /// UTF-8 插入：一个中文字占 3 字节，光标必须按**字节**推进。

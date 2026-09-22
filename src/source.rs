@@ -51,6 +51,16 @@ pub trait InputSource {
     /// \u53d6\u4e0b\u4e00\u4e2a\u8f93\u5165\u5355\u5143\u3002\u65e0\u8f93\u5165\u53ef\u53d6\u65f6\u8fd4\u56de [`InputItem::WouldBlock`]\uff1b
     /// \u8f93\u5165\u5df2\u7ec8\u7ed3\u65f6\u8fd4\u56de [`InputItem::Eof`]\u3002
     fn next_item(&mut self) -> InputItem;
+
+    /// 尝试补充输入（返回是否**新增**了可用字节）。
+    ///
+    /// **为何这个钩子必不可少**：输入源的字节来自外部（键盘、事件总线），
+    /// 而 `libline` 不应知道怎么取。若 `next_item` 返回 `WouldBlock` 后
+    /// 只能空转等待，输入永远不会再来——**这正是 L-2 首轮的真实缺陷**：
+    /// shell 只在进 `read_line` 前泵一次 stdin，队列排空后再没人调 `read`，
+    /// 于是用户后续按键全部丢失（实测：登录后连提示符都不再出现）。
+    /// 补充的责任在**输入源自己**，故在 trait 上开一个钩子。
+    fn refill(&mut self) -> bool;
 }
 
 /// \u5b57\u8282\u6d41\u8f93\u5165\u6e90\uff1a\u628a\u5b57\u8282\u6d41\u89e3\u7801\u4e3a\u8f93\u5165\u5355\u5143\uff08**\u5f53\u524d\u5b9e\u4f53**\uff09\u3002
@@ -91,6 +101,12 @@ impl ByteSource {
 }
 
 impl InputSource for ByteSource {
+    /// `ByteSource` 的字节由调用方 `push_bytes` 推入，自身无源可补：
+    /// 返回 false 表示「没有新增字节」，不伪造。
+    fn refill(&mut self) -> bool {
+        false
+    }
+
     /// \u53d6\u4e0b\u4e00\u4e2a\u8f93\u5165\u5355\u5143\u3002
     ///
     /// **\u5173\u952e\uff1a\u5185\u90e8\u5faa\u73af\u76f4\u5230\u4ea7\u51fa\u4e00\u4e2a\u771f\u5355\u5143\uff0c\u6216\u961f\u5217\u771f\u7684\u7a7a\u4e86\u3002**

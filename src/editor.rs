@@ -76,6 +76,41 @@ pub struct Editor {
     pub echo_suppressed: bool,
     /// 是否已被 `^C` 中断。
     pub interrupted: bool,
+    /// 能力集：哪些高级能力对本实例开放。
+    ///
+    /// **为何是运行时标志而非类型参数**：`login` 与 `shell` 共用同一个
+    /// `Editor`，区别只在「调用方用不用」。若用泛型参数表达，`login` 就得
+    /// 拟一个类型出来，增加它本不该有的构造负担。运行时标志同样能
+    /// **可执行地**拒绝越权：见 `apply` 里的门禁。
+    pub caps: EditorCaps,
+}
+
+/// 编辑器能力集（ADR-046 §4 条 3 的裁剪落点）。
+///
+/// 默认全开（`shell` 用）；`login` 只取回显控制，历史与补全在该实例上不可达。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditorCaps {
+    /// 历史上翻/下翻是否可用。
+    pub history: bool,
+    /// Tab 补全是否可用。
+    pub completion: bool,
+}
+
+impl Default for EditorCaps {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
+impl EditorCaps {
+    /// 全开（交互 shell 用）。
+    pub const fn full() -> Self {
+        Self { history: true, completion: true }
+    }
+    /// 裁剪到最小：只有逐字读入 + 退格 + 回显控制（登录用）。
+    pub const fn plain() -> Self {
+        Self { history: false, completion: false }
+    }
 }
 impl Editor {
     /// 新编辑器。
@@ -148,16 +183,27 @@ impl Editor {
                 self.cursor = self.buffer.len();
                 EditAction::Continue
             }
+            // Tab: capability off -> silently ignore (no insert, no candidate request).
+            // Silent (not an error) because Tab at a login prompt is a stray keystroke;
+            // what matters is that it must NOT complete. The gate lives here, so the
+            // host's `completions` is never called for a plain editor.
             InputItem::Complete => {
-                self.complete(host);
+                if self.caps.completion {
+                    self.complete(host);
+                }
                 EditAction::Continue
             }
+            // Up/Down: capability off -> ignore, so `login` cannot reach history.
             InputItem::HistoryPrev => {
-                self.history_prev();
+                if self.caps.history {
+                    self.history_prev();
+                }
                 EditAction::Continue
             }
             InputItem::HistoryNext => {
-                self.history_next();
+                if self.caps.history {
+                    self.history_next();
+                }
                 EditAction::Continue
             }
         }
@@ -304,6 +350,70 @@ pub fn smart_case_match(prefix: &[u8], candidate: &[u8]) -> bool {
     }
 }
 
+/// 一次「朴素读行」的配置（ADR-046 §4 条 3 的裁剪形态定稿）。
+///
+/// # 为何要有这个类型（而不是让 login 直接用 [`Editor`]）
+///
+/// ADR-046 §4 条 3 的要求：`login` 刻意保持朴素（S24 单一组件聚焦），
+/// 引入 `libline` **不应**让它背上历史/Tab 等无关能力——只取**回显抑制子集**。
+///
+/// 若 `login` 直接构造 [`Editor`]，它能拿到 `history` / `complete()` 等
+/// 全套能力；「不该用」只是**口头约定**，编译器不管。本类型 + [`read_line_plain`]
+/// 把约束**变成接口事实**：只暴露 `echo` 一个开关，不给历史、不给补全。
+///
+/// # 能力边界（明确到项）
+///
+/// | 能力 | `login` 是否需要 | 本接口是否提供 |
+/// |---|---|---|
+/// | 逐字符读入 + 退格 | ✅ 需要 | ✅ |
+/// | 回显抑制（口令） | ✅ 需要 | ✅ `echo` |
+/// | 光标左右 / Home / End | ❌ 不需要 | ⚠️ 见下 |
+/// | 历史上下翻 | ❌ 不需要 | ❌ 不提供 |
+/// | Tab 补全 | ❌ 不需要 | ❌ 不提供 |
+///
+/// **诚实说明「光标左右」**：`libline` 的编辑器核心天然支持光标移动，
+/// 而 `login` 的输入源又必须把方向键（CSI 序列）解析成某个输入单元。
+/// 二者相遇时 [`read_line_plain`] 会**照常处理光标移动**——这比「把方向键
+/// 当普通字符插进用户名」更正确，且不给 `login` 增加任何**它自己要写的代码**。
+/// 换言之：被裁掉的是**历史与补全**——即需要调用方提供数据与逻辑的那两项，
+/// 而非核心自带的编辑动作。这与 §4 条 3 的用意一致：不让 `login` 背上
+/// 「维护一份历史列表」「提供补全候选」这类负担。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlainLineOptions {
+    /// 是否**抑制**回显。
+    ///
+    /// `true` 用于读口令：此时**任何**输入都不上屏。
+    /// `false` 用于读用户名：边打边显示。
+    ///
+    /// **命名为何是 `suppress_echo` 而非 `echo`**：初版叫 `echo`，于是
+    /// `echo: false` 到底是「不回显」还是「不抑制」需要读两遍才能确定，
+    /// 而口令泄露的代价太高。改名后语义单向：取值直接就是
+    /// `Editor::echo_suppressed`。
+    ///
+    /// **该倒置错误当场被两项测试抓出**（`plain_read_with_echo_off_never_redraws`
+    /// 与它的对照组）：初版把 `echo: false` 映射成「不抑制」，测试立刻报
+    /// `redraw` 被调了 7 次。这正是否决「靠命名约定区分」的理由。
+    pub suppress_echo: bool,
+}
+
+/// 读一行，**不带历史、不带补全**（`login` 的裁剪接口）。
+///
+/// 返回值语义与 [`read_line`] 一致，便于调用方统一处理。
+///
+/// **与 [`read_line`] 的唯一区别**：本函数**不**向调用方索取任何补全候选，
+/// 故调用方的 [`EditorHost`] 实现里 `completions` 永远不会被调用
+/// （可以如实返回空）。这就是「按需裁剪」的落地形态。
+pub fn read_line_plain(
+    editor: &mut Editor,
+    src: &mut impl InputSource,
+    host: &mut impl EditorHost,
+    prompt: impl Fn(&mut dyn EditorHost),
+    opts: PlainLineOptions,
+) -> EditAction {
+    editor.echo_suppressed = opts.suppress_echo;
+    editor.caps = EditorCaps::plain();
+    read_line(editor, src, host, prompt)
+}
 /// 从输入源读一行（驱动编辑器直到提交/中断/EOF）。
 ///
 /// 这是对外的主循环：**只知道 [`InputSource`] 与 [`EditorHost`]**，
@@ -759,6 +869,274 @@ mod tests {
         assert_eq!(act, EditAction::Eof(b"a".to_vec()));
     }
 
+    // ---------------- L-3：login 的裁剪接口（ADR-046 §4 条 3） ----------------
+
+    /// 记录 `completions` 是否被调用过的 host。
+    ///
+    /// 这是 L-3 裁剪约束的**可执行证据**：若 `read_line_plain` 真的不给补全，
+    /// 则宿主永远不该收到补全请求。
+    #[derive(Default)]
+    struct CountingHost {
+        completion_calls: usize,
+        redraws: usize,
+        completions: Vec<Vec<u8>>,
+    }
+
+    impl EditorHost for CountingHost {
+        fn write(&mut self, _bytes: &[u8]) {}
+        fn redraw(&mut self, _buffer: &[u8], _cursor: usize) {
+            self.redraws += 1;
+        }
+        fn completions(&mut self, _word: &[u8], _is_command: bool) -> Vec<Vec<u8>> {
+            self.completion_calls += 1;
+            self.completions.clone()
+        }
+    }
+
+    /// **裁剪约束（核心）**：`read_line_plain` 期间按 Tab，宿主**不得**收到补全请求。
+    ///
+    /// 若本测试失败，说明 login 拿到了它不该有的补全能力——正是 §4 条 3 要防的。
+    #[test]
+    fn plain_read_never_requests_completions() {
+        let mut e = Editor::new();
+        let mut h = CountingHost {
+            completions: vec![b"shouldneverbeused".to_vec()],
+            ..Default::default()
+        };
+        let mut src = ByteSource::new();
+        // 'a' Tab 'b' Enter —— 中间夹一个 Tab
+        src.push_bytes(&[b'a', 0x09, b'b', b'\n']);
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(act, EditAction::Submitted(b"ab".to_vec()));
+        assert_eq!(h.completion_calls, 0, "plain read must not ask for completions");
+    }
+
+    /// **裁剪约束**：`read_line_plain` 期间按 ↑，**不得**召回任何历史。
+    ///
+    /// 验证方式：预先塞满历史，再按 ↑。若实现漏给了历史能力，
+    /// 缓冲区就会变成历史里那条，而不是空。
+    #[test]
+    fn plain_read_never_recalls_history() {
+        let mut e = Editor::new();
+        e.push_history(b"secret-from-history");
+        let mut h = CountingHost::default();
+        let mut src = ByteSource::new();
+        // ↑ 然后输入 'x' 再回车：若历史生效，结果会是 "secret-from-historyx"
+        src.push_bytes(b"\x1b[Ax\n");
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(
+            act,
+            EditAction::Submitted(b"x".to_vec()),
+            "history must not be reachable through the plain interface"
+        );
+    }
+
+    /// `echo: false` 时**任何**输入都不上屏（口令不回显）。
+    ///
+    /// 判据：`redraw` 一次都不许被调——因为「把口令画到屏幕上」正是要防的。
+    #[test]
+    fn plain_read_with_echo_off_never_redraws() {
+        let mut e = Editor::new();
+        let mut h = CountingHost::default();
+        let mut src = ByteSource::new();
+        src.push_bytes(b"hunter2\n");
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: true },
+        );
+        assert_eq!(act, EditAction::Submitted(b"hunter2".to_vec()));
+        assert_eq!(h.redraws, 0, "password must never reach the screen");
+    }
+
+    /// 对照：`echo: true` 时确实会重绘（证明上一测测的是抑制，而非「从不重绘」）。
+    #[test]
+    fn plain_read_with_echo_on_does_redraw() {
+        let mut e = Editor::new();
+        let mut h = CountingHost::default();
+        let mut src = ByteSource::new();
+        src.push_bytes(b"alice\n");
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(act, EditAction::Submitted(b"alice".to_vec()));
+        assert!(h.redraws > 0, "username should be visible while typing");
+    }
+
+    /// 退格在朴素接口下照常工作（login 依赖它修正打错的用户名）。
+    #[test]
+    fn plain_read_supports_backspace() {
+        let mut e = Editor::new();
+        let mut h = CountingHost::default();
+        let mut src = ByteSource::new();
+        src.push_bytes(&[b'a', b'b', 0x7f, b'c', b'\n']);
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(act, EditAction::Submitted(b"ac".to_vec()));
+    }
+
+    /// **L-3 回归**：连续两次「朴素读行」（用户名 + 口令）都必须返回。
+    ///
+    /// 真实内核上曾出现：第一次读（用户名）正常返回，第二次读（口令）
+    /// **永久挂住**。单测原本没覆盖它——因为既有测试总是新建一个 source，
+    /// 而 login 是**同一进程里连续两次**读。本测试用同一个 source 连读两次。
+    #[test]
+    fn two_consecutive_plain_reads_both_return() {
+        let mut src = ByteSource::new();
+        src.push_bytes(b"alice\r");
+        src.push_bytes(b"alicepw\r");
+        let mut h = CountingHost::default();
+
+        let mut e1 = Editor::new();
+        let a1 = read_line_plain(
+            &mut e1,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(a1, EditAction::Submitted(b"alice".to_vec()));
+
+        let mut e2 = Editor::new();
+        let a2 = read_line_plain(
+            &mut e2,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: true },
+        );
+        assert_eq!(a2, EditAction::Submitted(b"alicepw".to_vec()));
+    }
+
+    /// 同一 `Editor` 实例连读两次也必须都能返回。
+    #[test]
+    fn same_editor_two_plain_reads_both_return() {
+        let mut src = ByteSource::new();
+        src.push_bytes(b"alice\r");
+        src.push_bytes(b"alicepw\r");
+        let mut h = CountingHost::default();
+        let mut e = Editor::new();
+        let a1 = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(a1, EditAction::Submitted(b"alice".to_vec()));
+        let a2 = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: true },
+        );
+        assert_eq!(a2, EditAction::Submitted(b"alicepw".to_vec()));
+    }
+    /// **L-3 真相测试**：模拟 login 的真实时序——口令字符与 CR **分两批**到达，
+    /// 中间输入源报告「已补到货」。这精确复现真实内核上的挂住。
+    #[test]
+    fn plain_read_echo_off_with_refill_between_chars_and_cr() {
+        struct TwoPhase {
+            inner: ByteSource,
+            phase: usize,
+        }
+        impl InputSource for TwoPhase {
+            fn next_item(&mut self) -> InputItem {
+                self.inner.next_item()
+            }
+            fn refill(&mut self) -> bool {
+                // 第一批：口令字符。第二批：CR。之后再也没有。
+                match self.phase {
+                    0 => {
+                        self.inner.push_bytes(b"alicepw");
+                        self.phase = 1;
+                        true
+                    }
+                    1 => {
+                        self.inner.push_bytes(b"\r");
+                        self.phase = 2;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+        let mut e = Editor::new();
+        let mut h = CountingHost::default();
+        let mut src = TwoPhase { inner: ByteSource::new(), phase: 0 };
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: true },
+        );
+        assert_eq!(act, EditAction::Submitted(b"alicepw".to_vec()));
+    }
+
+    /// 同上，但用**用户名**语义（不抑制回显）——对照，验证不是回显抑制独有的问题。
+    #[test]
+    fn plain_read_echo_on_with_refill_between_chars_and_cr() {
+        struct TwoPhase {
+            inner: ByteSource,
+            phase: usize,
+        }
+        impl InputSource for TwoPhase {
+            fn next_item(&mut self) -> InputItem {
+                self.inner.next_item()
+            }
+            fn refill(&mut self) -> bool {
+                match self.phase {
+                    0 => {
+                        self.inner.push_bytes(b"alice");
+                        self.phase = 1;
+                        true
+                    }
+                    1 => {
+                        self.inner.push_bytes(b"\r");
+                        self.phase = 2;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+        let mut e = Editor::new();
+        let mut h = CountingHost::default();
+        let mut src = TwoPhase { inner: ByteSource::new(), phase: 0 };
+        let act = read_line_plain(
+            &mut e,
+            &mut src,
+            &mut h,
+            |_| {},
+            PlainLineOptions { suppress_echo: false },
+        );
+        assert_eq!(act, EditAction::Submitted(b"alice".to_vec()));
+    }
     /// UTF-8 插入：一个中文字占 3 字节，光标必须按**字节**推进。
     #[test]
     fn utf8_char_insert_advances_cursor_by_byte_len() {

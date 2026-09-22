@@ -29,7 +29,7 @@ pub mod editor;
 pub mod source;
 
 pub use editor::{
-    EditAction, Editor, EditorHost, longest_common_prefix, read_line, smart_case_match,
-    word_start,
+    EditAction, Editor, EditorHost, PlainLineOptions, longest_common_prefix, read_line,
+    read_line_plain, smart_case_match, word_start,
 };
 pub use source::{ByteSource, InputItem, InputSource};

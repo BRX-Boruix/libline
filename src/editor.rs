@@ -83,6 +83,16 @@ pub struct Editor {
     /// 拟一个类型出来，增加它本不该有的构造负担。运行时标志同样能
     /// **可执行地**拒绝越权：见 `apply` 里的门禁。
     pub caps: EditorCaps,
+    /// `^C` 要投递 `SIGINT` 到的**目标 pid**（ADR-046 §1.2 决策 2）。
+    ///
+    /// `None` = 不投递（例如 `login`，或 shell 当前没有前台子进程）。
+    ///
+    /// **为何由调用方设置而不是库自己去查**：目标语义已裁定为
+    /// 「shell 自己 spawn 的那个 `child` pid」——那是**调用方才知道**的事实。
+    /// 库若自己去查（例如问内核「谁是前台」），既越权也不成立：
+    /// 本内核**没有**前台进程组这一概念（ADR-043 决策 1 已拒绝 POSIX 会话/
+    /// 进程组），所以「前台」只存在于 shell 的记账里。
+    pub interrupt_target: Option<u64>,
 }
 
 /// 编辑器能力集（ADR-046 §4 条 3 的裁剪落点）。
@@ -123,6 +133,14 @@ impl Editor {
         self.echo_suppressed = on;
         self
     }
+    /// 设置 `^C` 的投递目标（见 [`Editor::interrupt_target`]）。
+    ///
+    /// 返回 `self` 以便链式构造；shell 在前台子进程存活期间设为 `Some(child)`，
+    /// 子进程结束后设回 `None`。
+    pub fn with_interrupt_target(mut self, pid: Option<u64>) -> Self {
+        self.interrupt_target = pid;
+        self
+    }
 
     /// 处理一个输入单元，返回编辑器的决定。
     ///
@@ -143,6 +161,22 @@ impl Editor {
                 self.buffer.clear();
                 self.cursor = 0;
                 self.nav = HistoryNav::default();
+                // ADR-046 §1.2 决策 2：`^C` 的**产生端在库内**——识别到控制字节
+                // 就投递 `SIGINT`，而不是把「要不要发信号」留给每个调用方各自
+                // 记得做（那正是 S28 要避免的重复）。
+                //
+                // **目标由调用方给定**（`interrupt_target`），库不猜：本内核没有
+                // 前台进程组，"谁算前台"只在 shell 的记账里（见字段文档）。
+                //
+                // **`None` 时静默不投递**：没有前台子进程可打断，`^C` 的语义就是
+                // 单纯作废当前输入行——这不是失败，故不报错。
+                //
+                // **投递失败也不改变 `Interrupted` 结论**：`kill` 可能因目标已退出
+                // 而返回 NotFound（典型的竞态：子进程恰在按键前结束）。用户要的是
+                // 「回到干净提示符」，已达到；把错误弹出来只会是噪音。故如实忽略。
+                if let Some(pid) = self.interrupt_target {
+                    let _ = libsys::signal::raise(pid as u64, libsys::signal::SIGINT);
+                }
                 EditAction::Interrupted
             }
             InputItem::Eof => EditAction::Eof(core::mem::take(&mut self.buffer)),
@@ -869,6 +903,80 @@ mod tests {
         assert_eq!(act, EditAction::Eof(b"a".to_vec()));
     }
 
+    // ---------------- L-4：^C 投递 SIGINT（ADR-046 §1.2） ----------------
+
+    /// **默认不投递**：`interrupt_target` 为 `None` 时 `^C` 只作废当前行。
+    ///
+    /// 这是 `login` 与「shell 当前无前台子进程」两种情形的共同语义——
+    /// 没有目标可打，不该猜一个。
+    #[test]
+    fn interrupt_without_target_only_discards_line() {
+        let mut e = Editor::new();
+        assert_eq!(e.interrupt_target, None, "target must default to None");
+        let mut h = FakeHost::default();
+        drive(&mut e, &mut h, &[InputItem::Char('x')]);
+        assert_eq!(e.apply(InputItem::Interrupt, &mut h), EditAction::Interrupted);
+        assert!(e.buffer.is_empty());
+    }
+
+    /// **目标由调用方设置**：`with_interrupt_target` 必须如实保存它。
+    ///
+    /// 本测试锁定「库不猜目标」这一契约的形状：目标是一个**显式输入**，
+    /// 不是一个由库自行推导的值。
+    #[test]
+    fn interrupt_target_is_whatever_the_caller_set() {
+        let e = Editor::new().with_interrupt_target(Some(4242));
+        assert_eq!(e.interrupt_target, Some(4242));
+        let e2 = Editor::new().with_interrupt_target(None);
+        assert_eq!(e2.interrupt_target, None);
+    }
+
+    /// **投递失败不改变结论**：目标 pid 不存在（宿主上任何 pid 都不存在）时，
+    /// `^C` 仍必须如实返回 `Interrupted` 并清空缓冲区。
+    ///
+    /// 这模拟真实竞态：子进程恰在用户按键前退出，`kill` 返回 NotFound。
+    /// 用户要的是「回到干净提示符」，已达成就够了——不该因此报错或卡住。
+    #[test]
+    fn interrupt_with_dead_target_still_interrupts() {
+        let mut e = Editor::new().with_interrupt_target(Some(999_999));
+        let mut h = FakeHost::default();
+        drive(&mut e, &mut h, &[InputItem::Char('a'), InputItem::Char('b')]);
+        assert_eq!(e.apply(InputItem::Interrupt, &mut h), EditAction::Interrupted);
+        assert!(e.buffer.is_empty(), "buffer cleared even if kill failed");
+        assert!(e.interrupted);
+    }
+
+    /// 端到端（库内）：`ByteSource` 里的 `0x03` 经 `apply` 必须走到投递分支。
+    ///
+    /// 与 `interrupt_with_dead_target_still_interrupts` 的区别：那条直接调
+    /// `apply`，这条从**真实字节**出发，证明 `0x03` 的解码与投递是同一条链。
+    #[test]
+    fn ctrl_c_byte_reaches_the_interrupt_path() {
+        let mut e = Editor::new().with_interrupt_target(Some(999_999));
+        let mut h = FakeHost::default();
+        let mut src = ByteSource::new();
+        src.push_bytes(&[b'a', 0x03]);
+        assert_eq!(src.next_item(), InputItem::Char('a'));
+        assert_eq!(src.next_item(), InputItem::Interrupt);
+        let act = e.apply(InputItem::Interrupt, &mut h);
+        assert_eq!(act, EditAction::Interrupted);
+        assert!(e.buffer.is_empty(), "0x03 must discard the pending line");
+    }
+
+    /// **`^D`（EOF）不得被误当中断**：两者相邻（0x03/0x04），必须分清。
+    #[test]
+    fn ctrl_d_is_eof_not_interrupt() {
+        let mut e = Editor::new().with_interrupt_target(Some(999_999));
+        let mut h = FakeHost::default();
+        let mut src = ByteSource::new();
+        src.push_bytes(&[b'x', 0x04]);
+        assert_eq!(src.next_item(), InputItem::Char('x'));
+        assert_eq!(src.next_item(), InputItem::Eof);
+        // 先把 'x' 真的送进编辑器，再送 EOF——否则测的是空缓冲区。
+        assert_eq!(e.apply(InputItem::Char('x'), &mut h), EditAction::Continue);
+        assert_eq!(e.apply(InputItem::Eof, &mut h), EditAction::Eof(b"x".to_vec()));
+        assert!(!e.interrupted, "EOF must not set the interrupt flag");
+    }
     // ---------------- L-3：login 的裁剪接口（ADR-046 §4 条 3） ----------------
 
     /// 记录 `completions` 是否被调用过的 host。

@@ -879,6 +879,66 @@ mod tests {
         assert!(src.refills >= 3, "must have refilled for each chunk");
     }
 
+    /// **契约钉子**：`read_line` 在 `refill` 返回 `false` 时**必须继续重试**
+    /// （而不是把控制权永久交还调用方 / 直接放弃）。
+    ///
+    /// 这条测试锁住 `editor.rs` 中 `if src.refill() { continue; }` 之后那段
+    /// 「补不到就 `yield_now()` 再 `continue`」的行为。它是 §6.7 契约的另一半：
+    ///
+    /// * 输入源的责任：**不要**用 `false` 表达「暂时没数据」（见 `source.rs` 的契约）；
+    /// * `read_line` 的责任：即便收到 `false` 也**不得终止读取**，而是让出后重试。
+    ///
+    /// 二者合起来才保证「击键最终一定被取到」。若将来有人把 `read_line` 改成
+    /// 「`refill` 返回 `false` 就返回 `EditAction::Eof`」，本测试会变红——
+    /// 那正是我们需要被拦住的改动（它会静默丢键）。
+    ///
+    /// **已验证本测试非恒真**：按上述违约写法改 `read_line` 后，本测试如实红灯
+    /// （`read_line must not give up while refill keeps saying false`）。
+    #[test]
+    fn read_line_keeps_retrying_after_refill_returns_false() {
+        /// 前 N 次 refill 都如实返回 `false`（模拟「暂时没数据」），
+        /// 之后才供货——以此验证 `read_line` **不会在 false 上放弃**。
+        struct FlakySource {
+            false_times: usize,
+            payload: Vec<u8>,
+            buf: ByteSource,
+            refills: usize,
+        }
+        impl InputSource for FlakySource {
+            fn next_item(&mut self) -> InputItem {
+                self.buf.next_item()
+            }
+            fn refill(&mut self) -> bool {
+                self.refills += 1;
+                if self.false_times > 0 {
+                    self.false_times -= 1;
+                    return false;
+                }
+                if self.payload.is_empty() {
+                    return false;
+                }
+                let p = core::mem::take(&mut self.payload);
+                self.buf.push_bytes(&p);
+                true
+            }
+        }
+
+        let mut e = Editor::new();
+        let mut h = FakeHost::default();
+        let mut src = FlakySource {
+            false_times: 5,
+            payload: b"ok\r".to_vec(),
+            buf: ByteSource::new(),
+            refills: 0,
+        };
+        let act = read_line(&mut e, &mut src, &mut h, |_| {});
+        assert_eq!(act, EditAction::Submitted(b"ok".to_vec()),
+                   "read_line must not give up while refill keeps saying false");
+        assert!(src.refills > 5,
+                "read_line must keep calling refill after false (got {} calls)",
+                src.refills);
+    }
+
     /// `ByteSource::refill` 如实报「无新增」，不伪造数据。
     #[test]
     fn byte_source_refill_reports_no_new_bytes() {

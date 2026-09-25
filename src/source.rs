@@ -316,7 +316,10 @@ pub trait EventBytes {
 /// 生产实现：读 `/devices/input/events`（阻塞语义，见 [`libsys::event::EventSourceReader`]）。
 impl EventBytes for libsys::event::EventSourceReader {
     fn fetch(&mut self, out: &mut alloc::vec::Vec<u8>) -> Result<(), libsys::Error> {
-        self.read_into(out).map(|_| ())
+        // **只取原始记录，不转换**（S13：转换恰好一次，在 refill 的 decode_into）。
+        // 与宿主测试 `ScriptedEvents` 的注入契约同构：fetch 给记录，refill 转换。
+        // 【实测缺陷记录（§6.14.4n）】原直调 read_into 会转换两次，按键毁于第二次转换。
+        self.read_records(out).map(|_| ())
     }
 }
 

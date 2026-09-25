@@ -267,3 +267,335 @@ pub(crate) fn csi_to_item(param: &[u8], final_byte: u8) -> InputItem {
         _ => InputItem::WouldBlock,
     }
 }
+
+/// 事件流输入源：字节来自 `/devices/input/events`（I-EVENTS 阶段 2，ADR-045）。
+///
+/// # 它与 [`ByteSource`] 的关系（S13 单一语义路径）
+///
+/// **不是**第二套解码器——内部的 `inner: ByteSource` 与字节流路径**完全同一个**，
+/// 转义序列、退格、提交等语义一字不差。二者**唯一的差别**是：
+///
+/// | | 字节从哪来 |
+/// | --- | --- |
+/// | `ByteSource`（旧路径） | 调用方 `read` fd 0（内核「键盘→stdin」直连） |
+/// | `EventSource`（本类型） | 调用方 `read` 事件节点，经 keymap 转换层产出字节 |
+///
+/// 故本类型只替换**取字节**这一件事，编辑语义零重复（S28）。
+///
+/// # 为何 keymap 在用户态（ADR-045 决策 3）
+///
+/// 内核只交**原始 scancode + 释放事件**，不认识字符。转换由
+/// `libsys::event::decode_into` 完成——它是内核 `decode_key` 的逐分支镜像，
+/// 且**释放事件**使「Shift 按住」可被用户态正确表达（字节流形态下被丢弃）。
+///
+/// # 阻塞语义（遵守 [`InputSource::refill`] 的契约）
+///
+/// [`read_into`](libsys::event::EventSourceReader::read_into) 内部走的是**阻塞**
+/// `read`：内核在事件环为空时登记等待者并挂起本进程（`input_event_stream()`
+/// 为真的节点），IRQ1 到达后唤醒。故 `false` 只会在**真错误**时出现——
+/// 符合「不得用 `false` 表达『暂时没数据』」的契约，**不会**出现 §6.7 的丢键窗口。
+/// 「取一批事件字节」的抽象（[`EventSource`] 对外的唯一依赖）。
+///
+/// # 为何要这一层（S23 纯函数优先 / S06 单一渲染点）
+///
+/// 真实实现走 `/devices/input/events` 的阻塞 `read`，**只在 QEMU 内可用**；
+/// 宿主上 `syscall` 返回垃圾。若 [`EventSource`] 直接依赖具体类型，则
+/// 「事件源与字节源是否等价」这条**最重要的判据**将无法在宿主测试——
+/// 只能靠肉眼看串口，正是本项目反复吃亏的模式（§6.12.7/§6.12.8）。
+///
+/// 抽出本 trait 后，宿主测试可注入**可控的事件字节序列**，从而逐字节比对
+/// 两条输入路径的产物。
+pub trait EventBytes {
+    /// 取一批原始**事件记录字节**（16 的整数倍），追加到 `out`。
+    ///
+    /// 返回 `Ok(())` 表示「本次调用已完成（可能有、也可能没有新字节）」；
+    /// `Err` 表示取字节本身失败（如节点不存在），由调用方如实处置。
+    fn fetch(&mut self, out: &mut alloc::vec::Vec<u8>) -> Result<(), libsys::Error>;
+}
+
+/// 生产实现：读 `/devices/input/events`（阻塞语义，见 [`libsys::event::EventSourceReader`]）。
+impl EventBytes for libsys::event::EventSourceReader {
+    fn fetch(&mut self, out: &mut alloc::vec::Vec<u8>) -> Result<(), libsys::Error> {
+        self.read_into(out).map(|_| ())
+    }
+}
+
+pub struct EventSource<R: EventBytes = libsys::event::EventSourceReader> {
+    /// 事件字节来源（生产=R 事件节点；测试=可控序列）。
+    reader: R,
+    /// **keymap 状态机**（Shift/Ctrl 位）。必须跨 `refill` 调用保持——
+    /// 否则「Shift 按下」与「Shift 释放」分处两批时状态会丢失。
+    keymap: libsys::event::KeymapState,
+    /// 与字节流路径**共用**的解码器（转义序列/退格/提交语义的唯一实现）。
+    ///
+    /// **它同时充当「待取字节」的缓冲区**：转换层一次 `read` 可能产出多个字节
+    /// （如 `\x1b[A` 三字节），而 `next_item` 的契约是**一次一个单元**。
+    /// 这些字节经 `push_bytes` 进入本字段排队，故无需再造一个缓冲（S13/S28）。
+    inner: ByteSource,
+}
+
+impl EventSource<libsys::event::EventSourceReader> {
+    /// 打开事件节点并构造输入源。
+    ///
+    /// **无事件节点时如实报错**，不静默回退到键盘直读（S09）——阶段 2 是**双轨**，
+    /// 回退决策属调用方（它可以选择用 [`ByteSource`] 那条轨道），
+    /// 不应由本类型代为隐瞒。
+    pub fn open() -> Result<Self, libsys::Error> {
+        Ok(Self {
+            reader: libsys::event::EventSourceReader::open()?,
+            keymap: libsys::event::KeymapState::default(),
+            inner: ByteSource::new(),
+        })
+    }
+
+    /// 关闭底层 fd（显式）。
+    pub fn close(self) -> Result<(), libsys::Error> {
+        self.reader.close()
+    }
+}
+
+impl<R: EventBytes> EventSource<R> {
+    /// 用**任意**事件字节来源构造（生产传读取器，测试传可控序列）。
+    pub fn from_reader(reader: R) -> Self {
+        Self { reader, keymap: libsys::event::KeymapState::default(), inner: ByteSource::new() }
+    }
+}
+
+impl<R: EventBytes> InputSource for EventSource<R> {
+    fn next_item(&mut self) -> InputItem {
+        self.inner.next_item()
+    }
+
+    fn refill(&mut self) -> bool {
+        let mut raw = alloc::vec::Vec::new();
+        // 第一批：从事件节点取**原始记录字节**。
+        let fetched = self.reader.fetch(&mut raw);
+        // **关键一步（S13：转换只有一处）**：原始事件记录必须经 `libsys::event`
+        // 的转换层变成字节，才能交给 `ByteSource` 解码。
+        //
+        // 【实现缺陷记录】本方法的初版**漏了这一步**——直接把 16 字节的原始记录
+        // 推进 `inner`，于是 `ByteSource` 把 scancode 当成 ASCII 逐字节解析，
+        // 产出的是 `* * H . .` 这类垃圾而非 `a o A`。该缺陷由本模块的等价性测试
+        // 在宿主上当场抓出（真实 QEMU 里表现为「按键完全错乱」）。
+        //
+        // 这是「事件路径与字节路径必须逐字节等价」这条判据的价值所在：
+        // 没有它，缺陷只会在交互时表现为「键盘坏了」，难以定位到本行。
+        let mut produced = alloc::vec::Vec::new();
+        if !raw.is_empty() {
+            let _ = libsys::event::decode_into(&mut self.keymap, &raw, &mut produced);
+        }
+        match fetched {
+            // 拿到了字节：推进解码器，返回 true 让 `read_line` 立刻重试。
+            Ok(()) if !produced.is_empty() => {
+                self.inner.push_bytes(&produced);
+                true
+            }
+            // 转换成功但**本次没有产出字节**（例如这一批全是 Shift 的按下/释放，
+            // 或全是未知 kind）：这**不是**「暂时没数据」，而是「数据已消费、暂无字节」。
+            //
+            // 返回 `false` 是安全的——但**必须**确保 `read_line` 之后会再次调用本方法
+            // 而不是空转：`read_line` 在 false 上 `yield_now()` 后 `continue`，
+            // 下一轮 `next_item` 为空 → 再次进入本方法 → 阻塞在内核等待者上。
+            // 故不会出现 §6.7 的「无人登记」窗口（那个缺陷的成因是**停留在用户态**
+            // 空转；这里每轮都会重新进入阻塞 `read`）。
+            Ok(()) => false,
+            // 真错误（含事件节点不存在）：如实报「补不到」，由调用方决定处置。
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use alloc::rc::Rc;
+    use core::cell::Cell;
+
+    /// 可控的事件字节来源：按脚本逐批交付，用尽后如实返回「无新字节」。
+    ///
+    /// 关键：它产出的字节是**事件记录**（16 字节/条），不是 ASCII——
+    /// 与真实事件节点同构，故走的是与 QEMU 里**完全相同**的转换路径。
+    struct ScriptedEvents {
+        batches: Vec<Vec<u8>>,
+        served: usize,
+        /// 外部可读的「是否已服务完全部批次」。
+        ///
+        /// **为何需要**：`drain` 必须知道输入**真的**取完了，才能停止。
+        /// 初版靠「连续两次 `refill` 返回 `false`」来推断，这是**错的**——
+        /// 事件流里「一批全是修饰键 ⇒ 产出 0 字节」是常态，连续两批无字节
+        /// **不代表**输入结束。该错误让 dribbled 用例提前退出、丢掉最后一个
+        /// `Submit`（实测红灯）。改为**显式**回报耗尽（S09：不靠启发式猜状态）。
+        exhausted: Rc<Cell<bool>>,
+    }
+    impl EventBytes for ScriptedEvents {
+        fn fetch(&mut self, out: &mut Vec<u8>) -> Result<(), libsys::Error> {
+            if self.served < self.batches.len() {
+                out.extend_from_slice(&self.batches[self.served]);
+                self.served += 1;
+            }
+            if self.served >= self.batches.len() {
+                self.exhausted.set(true);
+            }
+            Ok(())
+        }
+    }
+
+    /// 构造一个脚本化事件源，返回它本身与「耗尽标志」。
+    fn scripted(batches: Vec<Vec<u8>>) -> (ScriptedEvents, Rc<Cell<bool>>) {
+        let flag = Rc::new(Cell::new(batches.is_empty()));
+        (ScriptedEvents { batches, served: 0, exhausted: flag.clone() }, flag)
+    }
+
+    /// 一条键事件的线格式（与 `libsys::event` 的布局一致，16 字节小端）。
+    const DOWN: u8 = 1;
+    const UP: u8 = 2;
+    fn ev(kind: u8, e0: bool, code: u16) -> Vec<u8> {
+        let flags: u64 = if e0 { 1 } else { 0 };
+        let lo = (kind as u64) | (flags << 8) | ((code as u64) << 16);
+        let mut v = Vec::new();
+        v.extend_from_slice(&lo.to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+        v
+    }
+    fn down(code: u16) -> Vec<u8> { ev(DOWN, false, code) }
+    fn up(code: u16) -> Vec<u8> { ev(UP, false, code) }
+
+    /// 把事件序列拼成一批交付。
+    fn batch(recs: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for r in recs { v.extend_from_slice(r); }
+        v
+    }
+
+    /// 把整条字节流拆成 `InputItem` 序列（反复 refill 直到取完）。
+    /// 取完一个输入源的全部单元。
+    ///
+    /// `exhausted` 由脚本化来源在**服务完全部批次**时置位——用它判断结束，
+    /// 而不是靠「连续几次没产出」的启发式（那条路会丢数据，见 `ScriptedEvents`）。
+    /// 对 [`ByteSource`] 这类一次性推入的源，传入恒 `true` 的闭包即可：
+    /// 它的 `refill` 恒为 `false`，队列空了就是空了。
+    fn drain(src: &mut impl InputSource, exhausted: impl Fn() -> bool) -> Vec<InputItem> {
+        let mut items = Vec::new();
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            // 防死循环的硬上界：本测试的输入规模远小于此。
+            assert!(guard < 100_000, "drain did not terminate");
+            match src.next_item() {
+                InputItem::WouldBlock => {
+                    let got = src.refill();
+                    if !got && exhausted() {
+                        // 输入确实取完、且本轮没补到东西：再确认队列真的空了。
+                        if matches!(src.next_item(), InputItem::WouldBlock) {
+                            break;
+                        }
+                    }
+                }
+                other => items.push(other),
+            }
+        }
+        items
+    }
+
+    /// **本小点的核心判据（S13 单一语义路径）**：同一串按键，经
+    /// 「事件流 + 用户态 keymap」与经「纯字节流」必须产出**完全相同的
+    /// `InputItem` 序列**——这是阶段 2 「逐字节等价」的可测形式。
+    #[test]
+    fn test_event_source_equivalent_to_byte_source() {
+        // 一段覆盖多种语义的击键：普通字符、回车、退格、CSI 上箭头、Ctrl-C。
+        let events = batch(&[
+            down(0x1E), up(0x1E),   // a
+            down(0x18), up(0x18),   // o
+            down(0x2A),             // Shift 下
+            down(0x1E), up(0x1E),   // A
+            up(0x2A),               // Shift 上
+            down(0x0E), up(0x0E),   // Backspace
+            ev(DOWN, true, 0x48),   // E0 上箭头 -> CSI
+            down(0x1D),             // Ctrl 下
+            down(0x2E), up(0x2E),   // ^C
+            up(0x1D),
+            down(0x1C), up(0x1C),   // 回车
+        ]);
+        // 事件路径。
+        let (ev_src, done) = scripted(alloc::vec![events.clone()]);
+        let mut events_src = EventSource::from_reader(ev_src);
+        let got = drain(&mut events_src, || done.get());
+        // 字节路径：喂**同一条已转换的字节流**会引入第二套 keymap，
+        // 故这里直接喂「期望的字节」——它由内核既有语义决定（见下方断言）。
+        //
+        // 期望序列（逐项可读，便于失败时定位）：a o A \x08 \x1b[A \x03 \r
+        use InputItem::*;
+        let want = alloc::vec![
+            Char('a'), Char('o'), Char('A'), Backspace,
+            HistoryPrev, Interrupt, Submit,
+        ];
+        assert_eq!(got, want, "event path produced a different item sequence");
+    }
+
+    /// 字节路径（[`ByteSource`] + `push_bytes`）对**同一组字节**产出
+    /// 与事件路径相同的单元序列——两条路径共用同一解码器（S13）。
+    #[test]
+    fn test_byte_source_matches_event_source_on_same_bytes() {
+        // 事件路径产出以下字节（由内核既有语义决定）：
+        //   a o A \x08 \x1b[A \x03 \r
+        let bytes: &[u8] = b"aoA\x08\x1b[A\x03\r";
+        let mut byte_src = ByteSource::new();
+        byte_src.push_bytes(bytes);
+        // `ByteSource` 无外部源：队列空即耗尽，故传恒真。
+        let via_bytes = drain(&mut byte_src, || true);
+
+        let events = batch(&[
+            down(0x1E), up(0x1E), down(0x18), up(0x18),
+            down(0x2A), down(0x1E), up(0x1E), up(0x2A),
+            down(0x0E), up(0x0E),
+            ev(DOWN, true, 0x48),
+            down(0x1D), down(0x2E), up(0x2E), up(0x1D),
+            down(0x1C), up(0x1C),
+        ]);
+        let (ev2, done2) = scripted(alloc::vec![events]);
+        let mut events_src = EventSource::from_reader(ev2);
+        let via_events = drain(&mut events_src, || done2.get());
+
+        assert_eq!(via_events, via_bytes,
+                   "event path and byte path must be byte-equivalent");
+    }
+
+    /// **跨批到达**（真实事件流的常态）：一条记录一批，结果必须与
+    /// 一次性交付**完全相同**——状态机与待取字节缓冲跨 `refill` 保持。
+    #[test]
+    fn test_event_source_survives_one_record_per_batch() {
+        let recs = alloc::vec![
+            down(0x2A), down(0x1E), up(0x1E), up(0x2A), down(0x1C), up(0x1C),
+        ];
+        let one_shot = {
+            let (r, d) = scripted(alloc::vec![batch(&recs)]);
+            let mut s = EventSource::from_reader(r);
+            drain(&mut s, || d.get())
+        };
+        let dribbled = {
+            let (r, d) = scripted(recs.iter().map(|r| r.clone()).collect());
+            let mut s = EventSource::from_reader(r);
+            drain(&mut s, || d.get())
+        };
+        use InputItem::*;
+        assert_eq!(one_shot, alloc::vec![Char('A'), Submit]);
+        assert_eq!(dribbled, one_shot, "one-record-per-batch must be equivalent");
+    }
+
+    /// **`refill` 契约**（§6.7）：事件源在「有记录但无字节产出」时
+    /// （纯修饰键批次）返回 `false` 是允许的，但**不得**因此丢状态；
+    /// 后续批次到来时必须继续正确解码。
+    #[test]
+    fn test_event_source_keeps_shift_across_empty_yield_batch() {
+        let (r, d) = scripted(alloc::vec![
+            batch(&[down(0x2A)]),   // Shift 下：解析成功但产 0 字节
+            batch(&[down(0x1E), up(0x1E)]), // a -> 应是大写 A
+        ]);
+        let mut s = EventSource::from_reader(r);
+        let items = drain(&mut s, || d.get());
+        use InputItem::*;
+        assert_eq!(items, alloc::vec![Char('A')],
+                   "Shift state must survive a batch that yields no bytes");
+    }
+}

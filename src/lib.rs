@@ -32,4 +32,4 @@ pub use editor::{
     EditAction, Editor, EditorHost, PlainLineOptions, longest_common_prefix, read_line,
     read_line_plain, smart_case_match, word_start,
 };
-pub use source::{ByteSource, InputItem, InputSource};
+pub use source::{ByteSource, EventBytes, EventSource, InputItem, InputSource};

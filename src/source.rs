@@ -367,37 +367,40 @@ impl<R: EventBytes> InputSource for EventSource<R> {
     }
 
     fn refill(&mut self) -> bool {
-        // **阻塞-唤醒哨兵（关键，实测踩过）**：内核在事件环空时**挂起本进程**，
-        // 按键到达后以 `-EAGAIN` 哨兵唤醒，要求用户态**重试** `read`
-        // （`kernel/src/syscall.rs:2297`：「已挂起切走，用户态经哨兵重试 read」）。
+        // **阻塞-唤醒哨兵：这里必须「立刻重试」，不能返回 false**。
         //
-        // 故「本轮读到 0 字节」有两种含义，必须都重试：
-        //   (a) **唤醒哨兵**：内核刚挂起又唤醒，记录可能已就绪，**必须重读**；
-        //   (b) **本批无字节**：全是修饰键按下/释放（合法不产字节），下一批仍有数据。
+        // 内核在事件环空时**挂起本进程**，按键到达后以 `-EAGAIN` 哨兵唤醒，
+        // 要求用户态**重试** `read`（`kernel/src/syscall.rs:2297`）。
+        // 故 `WouldBlock` 的语义是「**现在就重试**」，而不是「暂无数据」。
         //
-        // 【实测缺陷记录】初版只取一批、空即返回 false，注释**误以为**「调用方
-        // 下一轮会重新进入阻塞 read」。实际调用方（`editor.rs:471-475`）在 false 上
-        // `yield_now()` 后重试，而哨兵使 read **立即返回**，于是形成**用户态空转**：
-        // 真机表现为「evsrcdemo 启动后整个会话冻结、宿主 CPU 31%、按键无任何输出」
-        // （`docs/TODO/terminal-input.md` §6.14.4i）。
+        // 【实测缺陷记录】本方法两版都错，方向相反，记录于此以免再犯：
+        //   初版：只取一批、空即 `false`，注释误以为「调用方下一轮会重新
+        //        进入阻塞 read」。实际哨兵使 read **立即返回**，于是用户态空转。
+        //   二版：在 `read_into` 里把哨兵**吞成** `Ok(0)`，再靠本方法有界重试——
+        //        吞掉后信号已丢失，仍然空转（宿主 CPU 28%、会话冻结）。
         //
-        // **为何是「有限次」重试而非无限循环**（这是在宿主测试里当场实测出的）：
-        // 阻塞是**内核**在 `read` 里做的（挂起本进程），`refill` 自己**无法阻塞**。
-        // 生产实现下每轮 `fetch` 都会调用内核 `read`，环空即挂起，循环天然有界；
-        // 但**宿主测试**的注入源是**有限序列**，耗尽后 `fetch` 立刻返回空——
-        // 无限循环会**永久挂死**（本修正的初版正是如此，被 `cargo test` 当场抓出）。
+        // **对照证据（S09）**：`evdemo` 与 `evsrcdemo` 走**同一条内核路径**，
+        // 唯一差别是前者在 `WouldBlock` 上直接 `continue`（**立刻重试 read**）。
+        // 结果：`evdemo` 全程正常（`reads=24 waits=10`）并在退出后把控制权交还 shell；
+        // `evsrcdemo` 冻结。故正确形态就是**照搬 evdemo 的重试语义**——
+        // 哨兵**不吞、不弃**，原样透传到本方法的循环条件里。
         //
-        // 故取上限 `MAX_RETRY`：生产上每轮都真阻塞，上限**不会被触及**；
-        // 它只保证「源确已耗尽」时方法必定返回，不制造挂死（S20 失败模式优先）。
+        // **为何仍保留上限**：阻塞是**内核**在 `read` 里做的（挂起本进程），
+        // 本方法**无法自行阻塞**；生产实现下每轮都会真阻塞，故上限不会被触及，
+        // 而它保证「源确已耗尽」（如宿主测试的有限注入序列）时方法必定返回，
+        // 不制造挂死（S20）。
         const MAX_RETRY: usize = 64;
         let mut raw = alloc::vec::Vec::new();
         let mut produced = alloc::vec::Vec::new();
         for _ in 0..MAX_RETRY {
             raw.clear();
             produced.clear();
-            // 真错误（含事件节点不存在）：如实返回「补不到」，由调用方处置（S09）。
-            if self.reader.fetch(&mut raw).is_err() {
-                return false;
+            match self.reader.fetch(&mut raw) {
+                // **哨兵：内核刚挂起又唤醒过本进程，立即重试**（不当作「无数据」）。
+                Err(libsys::Error::WouldBlock) => continue,
+                // 真错误（含事件节点不存在）：如实返回「补不到」，由调用方处置（S09）。
+                Err(_) => return false,
+                Ok(()) => {}
             }
             // **关键一步（S13：转换只有一处）**：原始事件记录必须经
             // `libsys::event` 的转换层变成字节，才能交给 `ByteSource` 解码。
@@ -406,12 +409,10 @@ impl<R: EventBytes> InputSource for EventSource<R> {
             // 推进 `inner`，于是 `ByteSource` 把 scancode 当成 ASCII 逐字节解析，
             // 产出的是 `* * H . .` 这类垃圾而非 `a o A`。该缺陷由本模块的等价性测试
             // 在宿主上当场抓出（真实 QEMU 里表现为「按键完全错乱」）。
-            //
-            // 这是「事件路径与字节路径必须逐字节等价」这条判据的价值所在：
-            // 没有它，缺陷只会在交互时表现为「键盘坏了」，难以定位到本行。
             if !raw.is_empty() {
                 let _ = libsys::event::decode_into(&mut self.keymap, &raw, &mut produced);
             }
+            // 本批无字节（例如整批都是修饰键）：下一批仍可能有数据，继续重试。
             if !produced.is_empty() {
                 self.inner.push_bytes(&produced);
                 return true;

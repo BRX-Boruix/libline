@@ -1,18 +1,16 @@
 # libline
 
-BORUIX's **user-space line editing library**: it turns a sequence of input items into one editable line of text.
+BORUIX's user-space line editing library, turning a sequence of input items into one editable line of text.
 
 [简体中文](README.md)
 
 ## Features
 
-| Capability | Details |
-| --- | --- |
-| Character editing | Typing, backspace, delete, moving the cursor left and right |
-| Movement within a line | Jump to the start or end of the line, move by word |
-| History | Page up and down through previously entered lines |
-| Tab completion | Complete by candidate prefix |
-| Echo suppression | Input is not displayed (used for password entry) |
+- Character editing: typing, backspace, delete, moving the cursor left and right
+- Movement within a line: jump to the start or end, move by word
+- History: page up and down through previously entered lines
+- Tab completion: complete by candidate prefix
+- Echo suppression: input is not displayed, used for password entry
 
 ## Usage
 
@@ -23,12 +21,7 @@ Referenced as a dependency:
 libline = { path = "../libline" }
 ```
 
-A caller may use all of the capabilities or only a subset:
-
-| Caller | Capabilities used |
-| --- | --- |
-| [`shell`](https://github.com/BRX-Boruix/shell) | All — history, completion, cursor editing, redraw |
-| [`login`](https://github.com/BRX-Boruix/login) | Echo suppression only |
+A caller may use all of the capabilities or only a subset. [`shell`](https://github.com/BRX-Boruix/shell) uses all of them; [`login`](https://github.com/BRX-Boruix/login) uses echo suppression only.
 
 ## Building
 
@@ -36,14 +29,11 @@ A caller may use all of the capabilities or only a subset:
 cargo test      # runs the editing core's tests on the host
 ```
 
-## Layout
+## Repository layout
 
-```
-libline/src/
-├── lib.rs      # module exports
-├── editor.rs   # the editing core
-└── source.rs   # input sources and the byte stream implementation
-```
+- `src/lib.rs` — module exports
+- `src/editor.rs` — the editing core
+- `src/source.rs` — input sources and the byte stream implementation
 
 ## Related projects
 

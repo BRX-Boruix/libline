@@ -254,7 +254,13 @@ impl Editor {
     }
 
     /// 历史去重（连续重复不记；空行不记）。
+    ///
+    /// 容量上界（S33）：`HISTORY_MAX` 条，超限丢最旧（环形语义）。
+    /// 无界 history 在长跑/高频输入下是堆增长点——多实例（并行
+    /// getty/login）场景曾实证把用户堆推到 brk/承诺账耗尽 → panic。
+    /// 32 条 × 行缓冲上界 = 有界稳态，`↑` 回溯深度足够交互使用。
     pub fn push_history(&mut self, line: &[u8]) {
+        const HISTORY_MAX: usize = 32;
         if line.is_empty() {
             return;
         }
@@ -262,6 +268,9 @@ impl Editor {
             if last.as_slice() == line {
                 return;
             }
+        }
+        if self.history.len() >= HISTORY_MAX {
+            self.history.remove(0);
         }
         self.history.push(line.to_vec());
     }
@@ -1313,5 +1322,42 @@ mod tests {
         drive(&mut e, &mut h, &[InputItem::Char('中')]);
         assert_eq!(e.buffer, "中".as_bytes().to_vec());
         assert_eq!(e.cursor, 3, "cursor is a byte offset");
+    }
+
+    /// history 容量上界（S33）：超过 32 条丢最旧（环形语义），条数
+    /// 恒 ≤ 32——无界 history 在多实例高频输入下曾把用户堆推到
+    /// OOM panic（洪泛缺陷主因，见 terminal-input.md §8）。
+    #[test]
+    fn history_is_capped_at_32_entries() {
+        let mut e = Editor::new();
+        let mut h = FakeHost::default();
+        // 提交 40 条互不重复的行 → history 必须停在 32 条。
+        for i in 0..40u8 {
+            let mut items: vec::Vec<InputItem> = b"line"
+                .iter()
+                .chain([b'0' + (i / 10), b'0' + (i % 10)].iter())
+                .map(|c| InputItem::Char(*c as char))
+                .collect();
+            items.push(InputItem::Submit);
+            drive(&mut e, &mut h, &items);
+        }
+        assert_eq!(e.history.len(), 32, "history capped at 32");
+        // 最旧的 8 条（line00..line07）已被丢弃——队首是 line08。
+        assert_eq!(e.history[0], b"line08".to_vec());
+        assert_eq!(e.history[31], b"line39".to_vec());
+    }
+
+    /// 去重后同条不重复入账；上界与去重叠加仍稳定 ≤ 32。
+    #[test]
+    fn history_dedup_interacts_with_cap() {
+        let mut e = Editor::new();
+        let mut h = FakeHost::default();
+        for _ in 0..50u8 {
+            drive(&mut e, &mut h, &[InputItem::Char('x'), InputItem::Submit]);
+            drive(&mut e, &mut h, &[InputItem::Char('y'), InputItem::Submit]);
+        }
+        assert!(e.history.len() <= 32, "cap holds under dedup");
+        // 交替 x/y 之间无连续重复——长度恰为 32（封顶）。
+        assert_eq!(e.history.len(), 32);
     }
 }
